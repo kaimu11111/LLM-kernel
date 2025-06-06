@@ -3,13 +3,15 @@ import cupyx.scipy.sparse as cxs
 import numpy as np
 from scipy.sparse import load_npz
 
+
+dataset = "yelp"
 # 加载 CSR 稀疏矩阵
-csr_cpu = load_npz("sparse_matrix.npz")
+csr_cpu = load_npz(f"sparse_matrix_{dataset}.npz")
 csr_gpu = cxs.csr_matrix(csr_cpu)
 
 # 创建稠密输入矩阵 X 和输出矩阵 Y
 n_cols = 128
-loaded = np.load("dense_matrix.npz")
+loaded = np.load(f"dense_matrix_{dataset}.npz")
 dense_matrix_np = loaded['data']  # 获取保存时用的键名
 dense_matrix_gpu = cp.asarray(dense_matrix_np)
 
@@ -342,6 +344,84 @@ Y = cp.zeros((csr_gpu.shape[0], n_cols), dtype=cp.float32)
 # '''
 ####################################################################################################
 # Verision 2-3-2                    59.179 ms
+# spmm_kernel_code = r'''
+# extern "C" __global__ void spmm_csr(
+#     const int* __restrict__ indptr,
+#     const int* __restrict__ indices,
+#     const float* __restrict__ data, 
+#     const float* __restrict__ B,
+#     float* __restrict__ C,
+#     int M, int K
+# ) {
+#     const int TILE_SIZE = 32;
+#     const int COLS_PER_BLOCK = 8;
+    
+#     int row = blockIdx.x * blockDim.x + threadIdx.x;
+#     int col_block = blockIdx.y;
+#     int col_start = col_block * COLS_PER_BLOCK;
+#     int col_end = min(col_start + COLS_PER_BLOCK, K);
+    
+#     // Shared memory for B matrix tiles
+#     __shared__ float B_shared[TILE_SIZE][COLS_PER_BLOCK];
+    
+#     if (row >= M) return;
+    
+#     int row_start = indptr[row];
+#     int row_end = indptr[row + 1];
+    
+#     float sum[COLS_PER_BLOCK];
+#     #pragma unroll
+#     for (int i = 0; i < COLS_PER_BLOCK; ++i) {
+#         sum[i] = 0.0f;
+#     }
+    
+#     // Process sparse elements in tiles
+#     for (int tile_start = 0; tile_start < row_end - row_start; tile_start += TILE_SIZE) {
+#         int tile_end = min(tile_start + TILE_SIZE, row_end - row_start);
+        
+#         // Cooperatively load B matrix data into shared memory
+#         for (int jj = row_start + tile_start + threadIdx.x; 
+#              jj < row_start + tile_end; 
+#              jj += blockDim.x) {
+#             if (jj < row_end) {
+#                 int sparse_col = indices[jj];
+#                 int local_idx = jj - (row_start + tile_start);
+                
+#                 #pragma unroll
+#                 for (int c = 0; c < COLS_PER_BLOCK && col_start + c < K; ++c) {
+#                     if (local_idx < TILE_SIZE) {
+#                         B_shared[local_idx][c] = B[sparse_col * K + col_start + c];
+#                     }
+#                 }
+#             }
+#         }
+        
+#         __syncthreads();
+        
+#         // Compute using shared memory
+#         for (int jj = row_start + tile_start; jj < row_start + tile_end; ++jj) {
+#             float sparse_val = data[jj];
+#             int local_idx = jj - (row_start + tile_start);
+            
+#             #pragma unroll
+#             for (int c = 0; c < COLS_PER_BLOCK && col_start + c < K; ++c) {
+#                 sum[c] += sparse_val * B_shared[local_idx][c];
+#             }
+#         }
+        
+#         __syncthreads();
+#     }
+    
+#     // Store results
+#     #pragma unroll
+#     for (int c = 0; c < COLS_PER_BLOCK && col_start + c < K; ++c) {
+#         C[row * K + col_start + c] = sum[c];
+#     }
+# }
+# '''
+######################################################################################################
+
+# Test to optimize the 2-3-2
 spmm_kernel_code = r'''
 extern "C" __global__ void spmm_csr(
     const int* __restrict__ indptr,
@@ -351,74 +431,40 @@ extern "C" __global__ void spmm_csr(
     float* __restrict__ C,
     int M, int K
 ) {
-    const int TILE_SIZE = 32;
-    const int COLS_PER_BLOCK = 8;
+    const int WARP_SIZE = 32;
+    const int COLS_PER_WARP = 32;
     
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    int col_block = blockIdx.y;
-    int col_start = col_block * COLS_PER_BLOCK;
-    int col_end = min(col_start + COLS_PER_BLOCK, K);
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int row = warp_id;
+    int col = blockIdx.y * COLS_PER_WARP + lane_id;
     
-    // Shared memory for B matrix tiles
-    __shared__ float B_shared[TILE_SIZE][COLS_PER_BLOCK];
-    
-    if (row >= M) return;
+    if (row >= M || col >= K) return;
     
     int row_start = indptr[row];
     int row_end = indptr[row + 1];
     
-    float sum[COLS_PER_BLOCK];
-    #pragma unroll
-    for (int i = 0; i < COLS_PER_BLOCK; ++i) {
-        sum[i] = 0.0f;
+    float sum = 0.0f;
+    
+    // Each thread in warp handles one column
+    for (int jj = row_start; jj < row_end; ++jj) {
+        int sparse_col = indices[jj];
+        float sparse_val = data[jj];
+        sum = fmaf(sparse_val, B[sparse_col * K + col], sum);
     }
     
-    // Process sparse elements in tiles
-    for (int tile_start = 0; tile_start < row_end - row_start; tile_start += TILE_SIZE) {
-        int tile_end = min(tile_start + TILE_SIZE, row_end - row_start);
-        
-        // Cooperatively load B matrix data into shared memory
-        for (int jj = row_start + tile_start + threadIdx.x; 
-             jj < row_start + tile_end; 
-             jj += blockDim.x) {
-            if (jj < row_end) {
-                int sparse_col = indices[jj];
-                int local_idx = jj - (row_start + tile_start);
-                
-                #pragma unroll
-                for (int c = 0; c < COLS_PER_BLOCK && col_start + c < K; ++c) {
-                    if (local_idx < TILE_SIZE) {
-                        B_shared[local_idx][c] = B[sparse_col * K + col_start + c];
-                    }
-                }
-            }
-        }
-        
-        __syncthreads();
-        
-        // Compute using shared memory
-        for (int jj = row_start + tile_start; jj < row_start + tile_end; ++jj) {
-            float sparse_val = data[jj];
-            int local_idx = jj - (row_start + tile_start);
-            
-            #pragma unroll
-            for (int c = 0; c < COLS_PER_BLOCK && col_start + c < K; ++c) {
-                sum[c] += sparse_val * B_shared[local_idx][c];
-            }
-        }
-        
-        __syncthreads();
-    }
-    
-    // Store results
-    #pragma unroll
-    for (int c = 0; c < COLS_PER_BLOCK && col_start + c < K; ++c) {
-        C[row * K + col_start + c] = sum[c];
-    }
+    C[row * K + col] = sum;
 }
 '''
-######################################################################################################
 
+
+
+
+
+
+
+
+#######################################################################################################
 
 #Version 2-3-3                                              1050ms
 # spmm_kernel_code = r'''

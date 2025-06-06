@@ -4,13 +4,14 @@
 # import time
 # from scipy.sparse import load_npz
 
+# dataset = "yelp"
 
-# csr_cpu = load_npz("sparse_matrix.npz")
+# csr_cpu = load_npz(f"sparse_matrix_{dataset}.npz")
 # csr_gpu = cxs.csr_matrix(csr_cpu)
 
 
 # n_cols = 128
-# loaded = np.load("dense_matrix.npz")
+# loaded = np.load(f"dense_matrix_{dataset}.npz")
 # dense_matrix_np = loaded['data']
 # dense_matrix_gpu = cp.asarray(dense_matrix_np)
 
@@ -50,8 +51,10 @@ import numpy as np
 import time
 from scipy.sparse import load_npz
 
+
+dataset = "yelp"
 # Load sparse matrix and convert to PyTorch
-csr_cpu = load_npz("sparse_matrix.npz")
+csr_cpu = load_npz(f"sparse_matrix_{dataset}.npz")
 print(f"Loaded sparse matrix shape: {csr_cpu.shape}")
 
 # Convert CSR to COO format to get row and column indices
@@ -69,7 +72,7 @@ sparse_tensor_gpu = sparse_tensor_cpu.to(device).to_sparse_csr()
 
 # Load dense matrix
 n_cols = 128
-loaded = np.load("dense_matrix.npz")
+loaded = np.load(f"dense_matrix_{dataset}.npz")
 dense_matrix_np = loaded['data']
 dense_matrix_gpu = torch.from_numpy(dense_matrix_np).float().to(device)
 

@@ -31,8 +31,8 @@ cols_out = cp.zeros(max_nnz, dtype=cp.int32)
 vals_out = cp.zeros(max_nnz, dtype=cp.float32)
 nnz_counter = cp.zeros(1, dtype=cp.int32)
 
-# CUDA kernel
-spgemm_kernel = cp.RawKernel(r'''
+# CUDA kernel                    optimized kernel
+spgemm_kernel = cp.RawKernel(r'''                
 extern "C" __global__
 void spgemm_kernel(
     const int* __restrict__ indptrA,
@@ -103,6 +103,51 @@ void spgemm_kernel(
 
 ''', 'spgemm_kernel')
 
+
+
+# original kernel
+# spgemm_kernel = cp.RawKernel(r''' 
+# extern "C" __global__                                                                 
+# void spgemm_kernel(
+#     const int* indptrA,
+#     const int* indicesA,
+#     const float* dataA,
+#     const int* indptrB,
+#     const int* indicesB,
+#     const float* dataB,
+#     int* rows_out,
+#     int* cols_out,
+#     float* vals_out,
+#     int* nnz_counter,
+#     int m
+# ) {
+#     int row = blockDim.x * blockIdx.x + threadIdx.x;
+#     if (row >= m) return;
+
+#     int startA = indptrA[row];
+#     int endA = indptrA[row + 1];
+
+#     for (int i = startA; i < endA; ++i) {
+#         int k = indicesA[i];
+#         float valA = dataA[i];
+
+#         int startB = indptrB[k];
+#         int endB = indptrB[k + 1];
+
+#         for (int j = startB; j < endB; ++j) {
+#             int col = indicesB[j];
+#             float valB = dataB[j];
+
+#             int idx = atomicAdd(nnz_counter, 1);
+#             if (idx < 10000000) {
+#                 rows_out[idx] = row;
+#                 cols_out[idx] = col;
+#                 vals_out[idx] = valA * valB;
+#             }
+#         }
+#     }
+# }
+# ''','spgemm_kernel')
 # 预热一次
 threads = 128
 blocks = (m + threads - 1) // threads
